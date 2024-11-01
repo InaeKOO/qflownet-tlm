@@ -45,7 +45,7 @@ Available options:
 - List of available algorithms: `db`, `tb`, `subtb`, `soft_dqn`, and `munchausen_dqn`;
 - List of available backward approaches: `uniform`, `naive`, `maxent`, and `tlm`.
 
-An example how to run the experiment from the `hypergrid/` directory with `standard` rewards, seed `3` on the algorithm `munchausen_dqn` and backward approach `tlm`:
+Run the experiment from the `hypergrid/` directory with `standard` rewards, seed `3` on the algorithm `munchausen_dqn` and backward approach `tlm`:
 ```bash
 python run_hypergrid_exp.py --general experiments/config/general.py:3 --env experiments/config/hypergrid.py:standard --algo experiments/config/algo.py:munchausen_dqn --algo.backward_approach tlm
 ```
@@ -56,9 +56,11 @@ python run_hypergrid_exp.py --general experiments/config/general.py:3 --env expe
 
 ## Bit sequences
 
-Code for this environment is based on open repository (https://github.com/d-tiapkin/gflownet-rl).
+Code for this environment is based on the open repository (https://github.com/d-tiapkin/gflownet-rl).
 
-Examples of running `DB` with learning rate `0.002` and varying backward approaches:
+To control hyperparameters, we refer to `bitseq/run.py`.
+
+Examples of running `DB` from the `bitseq/` directory with learning rate `0.002` and varying backward approaches:
 
 ```
 python bitseq/run.py --objective db --learning_rate 0.002 --backward_approach tlm
@@ -81,7 +83,7 @@ To control hyperparameters, we refer to `mols/tasks/qm9.py` and `mols/tasks/seh_
 - List of available algorithms: `db`, `tb`, `subtb`, and `dqn`;
 - List of available backward approaches: `uniform`, `naive`, `maxent`, and `tlm`.
 
-To reproduce the QM9 experiment with `Munchausen DQN`, learning rate `5e-4` and backward approach `TLM`:
+Run from the root directory to reproduce the QM9 experiment with `Munchausen DQN`, learning rate `5e-4` and backward approach `tlm`:
 ```bash
 python -m mols.tasks.qm9 --seed 1 --algo dqn --lr 5e-4 --backward_approach tlm
 ```

@@ -54,8 +54,6 @@ To train with `uniform` backward policy for this setting:
 python run_hypergrid_exp.py --general experiments/config/general.py:3 --env experiments/config/hypergrid.py:standard --algo experiments/config/algo.py:munchausen_dqn --algo.backward_approach uniform
 ```
 
-## Bit sequences is COMING SOON
-
 ## Bit sequences
 
 Code for this environment is based on open repository (https://github.com/d-tiapkin/gflownet-rl).

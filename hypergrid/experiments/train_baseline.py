@@ -4,12 +4,15 @@ https://github.com/GFNOrg/torchgfn/blob/master/tutorials/examples/train_hypergri
 """
 
 import os
+import random
 import torch
 from copy import deepcopy
 
 # import wandb
 from tqdm import tqdm, trange
 import numpy as np
+
+from algorithms import TorchRLReplayBuffer
 
 from gfn.gflownet import (
     DBGFlowNet,
@@ -31,10 +34,14 @@ def train_baseline(
     algo_config: ConfigDict,
 ):
     use_wandb = len(general_config.wandb_project) > 0
-    experiment_name += f"_lr={algo_config.learning_rate}_lrg={algo_config.gamma}"
+
+    gamma = algo_config.gamma if algo_config.backward_approach == "tlm" else 1
+    pb_tau = algo_config.pb_tau if algo_config.backward_approach == "tlm" else 0
+
+    experiment_name += f"_lr={algo_config.learning_rate}_lrg={gamma}"
     experiment_name += f"_{algo_config.backward_approach}"
     if algo_config.backward_approach == "tlm":
-        experiment_name += f"_pb_tau={algo_config.pb_tau}"
+        experiment_name += f"_pb_tau={pb_tau}"
     if algo_config.first_pf_update:
         experiment_name += f"_first_pf_update"
     print(f"{experiment_name=}", flush=True)
@@ -70,7 +77,7 @@ def train_baseline(
     assert pf_module is not None, f"pf_module is None. Command-line arguments: {algo_config}"
     assert pb_module is not None, f"pb_module is None. Command-line arguments: {algo_config}"
     pf_estimator = DiscretePolicyEstimator(env=env, module=pf_module, forward=True)
-    if algo_config.backward_approach == "tlm":
+    if algo_config.backward_approach in ["tlm", "pessimistic"]:
         target_pb_module = deepcopy(pb_module)
         target_pb_module.load_state_dict(pb_module.state_dict())
         target_pb_estimator = DiscretePolicyEstimator(env=env, module=target_pb_module, forward=False)
@@ -117,8 +124,11 @@ def train_baseline(
             on_policy=False,
         )
 
+    pessimistic_buffer = []
+    pessimistic_buffer_size = 20
+
     # 3. Create the optimizer
-    if algo_config.backward_approach == "tlm":
+    if algo_config.backward_approach in ["tlm", "pessimistic"]:
         params_list = [v for k, v in dict(gflownet.named_parameters()).items() if (not "pb" in k and k != "logZ")]
     else:
         params_list = [v for k, v in dict(gflownet.named_parameters()).items() if k != "logZ"]
@@ -138,15 +148,16 @@ def train_baseline(
         )
     optimizer = torch.optim.Adam(params)
 
-    if algo_config.backward_approach == "tlm":
+    if algo_config.backward_approach in ["tlm", "pessimistic"]:
         pb_params = [
             {
                 "params": pb_module.parameters(),
                 "lr": algo_config.learning_rate,
             }
         ]
+
         pb_optimizer = torch.optim.Adam(pb_params)
-        pb_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(pb_optimizer, algo_config.gamma)
+        pb_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(pb_optimizer, gamma)
 
     visited_terminating_states = env.States.from_batch_shape((0,))
 
@@ -166,7 +177,7 @@ def train_baseline(
 
     def update_backward_policy_if_required(trajectories):
         # with torch.autograd.set_detect_anomaly(True):
-        if algo_config.backward_approach == "tlm":
+        if algo_config.backward_approach in ["tlm", "pessimistic"]:
             pb_optimizer.zero_grad()
 
             # this code is taken from the class TrajectoryBasedGFlowNet(PFBasedGFlowNet)
@@ -190,20 +201,26 @@ def train_baseline(
 
             with torch.no_grad():
                 for param, target_param in zip(pb_module.parameters(), target_pb_module.parameters()):
-                    target_param.data.mul_(1 - algo_config.pb_tau)
-                    torch.add(target_param.data, param.data, alpha=algo_config.pb_tau, out=target_param.data)
+                    target_param.data.mul_(1 - pb_tau)
+                    torch.add(target_param.data, param.data, alpha=pb_tau, out=target_param.data)
 
             pb_optimizer.zero_grad()
 
     for iteration in range(n_iterations):
         trajectories = gflownet.sample_trajectories(n_samples=general_config.n_envs)
         training_samples = gflownet.to_training_samples(trajectories)
+        if algo_config.backward_approach == "pessimistic":
+            pessimistic_buffer.append(trajectories)
+            pessimistic_buffer = pessimistic_buffer[-pessimistic_buffer_size:]
+            trajectories_for_pb_update = pessimistic_buffer[random.randint(0, len(pessimistic_buffer) - 1)]
+        else:
+            trajectories_for_pb_update = trajectories
 
         if algo_config.first_pf_update:
             loss = update_forward_policy(training_samples)
-            update_backward_policy_if_required(trajectories)
+            update_backward_policy_if_required(trajectories_for_pb_update)
         else:
-            update_backward_policy_if_required(trajectories)
+            update_backward_policy_if_required(trajectories_for_pb_update)
             loss = update_forward_policy(training_samples)
 
         visited_terminating_states.extend(trajectories.last_states)
@@ -230,7 +247,7 @@ def train_baseline(
             l1_history.append(to_log["l1_dist"])
             nstates_history.append(to_log["states_visited"])
 
-            if algo_config.backward_approach in ["tlm", "naive"]:
+            if algo_config.backward_approach in ["tlm", "pessimistic", "naive"]:
                 valid_states = trajectories.states[~trajectories.states.is_sink_state]
                 valid_actions = trajectories.actions[~trajectories.actions.is_dummy]
 

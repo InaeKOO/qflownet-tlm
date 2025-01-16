@@ -1,3 +1,4 @@
+import random
 import os
 import json
 from copy import deepcopy
@@ -36,7 +37,8 @@ def train_softdqn(
     if algo_config.munchausen.alpha > 0:
         experiment_name += f"_M_alpha={algo_config.munchausen.alpha}"
 
-    experiment_name += f"_lr={algo_config.learning_rate}_lrg={algo_config.gamma}"
+    gamma = algo_config.gamma if algo_config.backward_approach == "tlm" else 1
+    experiment_name += f"_lr={algo_config.learning_rate}_lrg={gamma}"
     experiment_name += f"_{algo_config.backward_approach}"
     if algo_config.backward_approach == "tlm" and not algo_config.smooth_pb:
         experiment_name += "_not_smooth"
@@ -113,7 +115,7 @@ def train_softdqn(
     else:
         raise NotImplementedError(f"{algo_config.loss_type} loss is not supported")
 
-    if algo_config.backward_approach == "tlm":
+    if algo_config.backward_approach in ["tlm", "pessimistic"]:
         pf_params = [
             {
                 "params": [
@@ -130,7 +132,7 @@ def train_softdqn(
             }
         ]
         pb_optimizer = torch.optim.Adam(pb_params)
-        pb_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(pb_optimizer, algo_config.gamma)
+        pb_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(pb_optimizer, gamma)
     else:
         pf_params = [
             {
@@ -158,12 +160,15 @@ def train_softdqn(
         return loss
 
     def update_backward_policy_if_required(training_samples):
-        if algo_config.backward_approach == "tlm":
+        if algo_config.backward_approach in ["tlm", "pessimistic"]:
             pb_optimizer.zero_grad()
             pb_loss = gflownet.get_pb_loss(training_samples)
             pb_loss.backward()
             pb_optimizer.step()
             pb_lr_scheduler.step()
+
+    pessimistic_buffer = []
+    pessimistic_buffer_size = 20
 
     # Train loop
     # for iteration in trange(n_iterations):
@@ -171,10 +176,17 @@ def train_softdqn(
         progress = float(iteration) / n_iterations
         trajectories = gflownet.sample_trajectories(n_samples=general_config.n_envs)
         training_samples = gflownet.to_training_samples(trajectories)
+        if algo_config.backward_approach == "pessimistic":
+            pessimistic_buffer.append(trajectories)
+            pessimistic_buffer = pessimistic_buffer[-pessimistic_buffer_size:]
+            trajectories_for_pb_update = pessimistic_buffer[random.randint(0, len(pessimistic_buffer) - 1)]
+            training_samples_for_pb_update = gflownet.to_training_samples(trajectories_for_pb_update)
+        else:
+            training_samples_for_pb_update = training_samples
 
         update_model = iteration > algo_config.learning_starts and iteration % algo_config.update_frequency == 0
         if update_model and not algo_config.first_pf_update:
-            update_backward_policy_if_required(training_samples)
+            update_backward_policy_if_required(training_samples_for_pb_update)
 
         if replay_buffer is not None:
             with torch.no_grad():
@@ -189,7 +201,7 @@ def train_softdqn(
                     replay_buffer.add(training_samples)
 
             if iteration > algo_config.learning_starts:
-                training_objects, rb_batch = replay_buffer.sample() 
+                training_objects, rb_batch = replay_buffer.sample()
                 scores = gflownet.get_scores(training_objects)
         else:
             training_objects = training_samples
@@ -198,7 +210,7 @@ def train_softdqn(
         if update_model:
             if algo_config.first_pf_update:
                 loss = update_forward_policy(scores, rb_batch)
-                update_backward_policy_if_required(training_samples)
+                update_backward_policy_if_required(training_samples_for_pb_update)
             else:
                 loss = update_forward_policy(scores, rb_batch)
 

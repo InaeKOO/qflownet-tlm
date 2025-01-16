@@ -12,7 +12,7 @@ def get_config(alg_name):
                 "gamma": 0.999,
                 "loss_type": "Huber",  # "MSE" or "Huber"
                 "smooth_pb": True,
-                "backward_approach": "uniform",  # uniform / naive / maxent / tlm
+                "backward_approach": "uniform",  # uniform / naive / maxent / tlm / pessimistic
                 "net": ConfigDict(
                     {
                         "hidden_dim": 256,
@@ -50,7 +50,7 @@ def get_config(alg_name):
                 "gamma": 0.999,
                 "loss_type": "Huber",  # "MSE" or "Huber"
                 "smooth_pb": True,
-                "backward_approach": "uniform",  # uniform / naive / maxent / tlm
+                "backward_approach": "uniform",  # uniform / naive / maxent / tlm / pessimistic
                 "net": ConfigDict(
                     {
                         "hidden_dim": 256,
@@ -88,7 +88,7 @@ def get_config(alg_name):
                 "learning_rate_Z": 1e-1,
                 "gamma": 0.999,
                 "pb_tau": 0.25,
-                "backward_approach": "uniform",  # uniform / naive / maxent / tlm
+                "backward_approach": "uniform",  # uniform / naive / maxent / tlm / pessimistic
                 "net": ConfigDict(
                     {
                         "hidden_dim": 256,
@@ -106,7 +106,7 @@ def get_config(alg_name):
                 "learning_rate": 1e-3,
                 "gamma": 0.999,
                 "pb_tau": 0.25,
-                "backward_approach": "uniform",  # uniform / naive / maxent / tlm
+                "backward_approach": "uniform",  # uniform / naive / maxent / tlm / pessimistic
                 "net": ConfigDict(
                     {
                         "hidden_dim": 256,
@@ -124,7 +124,7 @@ def get_config(alg_name):
                 "learning_rate": 1e-3,
                 "gamma": 0.999,
                 "pb_tau": 0.25,
-                "backward_approach": "uniform",  # uniform / naive / maxent / tlm
+                "backward_approach": "uniform",  # uniform / naive / maxent / tlm / pessimistic
                 "net": ConfigDict(
                     {
                         "hidden_dim": 256,

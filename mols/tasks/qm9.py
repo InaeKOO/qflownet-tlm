@@ -28,7 +28,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--debug", action="store_true", help="Debug flag. Must be disabled for experiments reproduction.")
 
 parser.add_argument("--seed", type=int, default=0, help="Random seed.")
-parser.add_argument("--temp", type=int, default=1, help="Reward normalizing exponent.")
+parser.add_argument("--temp", type=int, default=10, help="Reward normalizing exponent.")
 parser.add_argument("--n", type=int, default=20_000, help="Number of training iterations.")
 parser.add_argument("--batch_size", type=int, default=128, help="Batch size.")
 
@@ -50,7 +50,7 @@ parser.add_argument("--algo", type=str, choices=["tb", "db", "subtb", "dqn"], he
 parser.add_argument(
     "--backward_approach",
     type=str,
-    choices=["uniform", "naive", "tlm", "maxent"],
+    choices=["uniform", "naive", "tlm", "maxent", "pessimistic"],
     default="uniform",
     help="Backward policy approach to use.",
 )
@@ -136,6 +136,7 @@ class QM9GapTask(GFNTask):
         elif self._rtrans == "unit":
             return (1 - rp) * self._width + self._min
         elif self._rtrans == "unit+95p":
+            print(self._wi)
             return (1 - rp + (1 - self._percentile_95)) * self._width + self._min
 
     def load_task_models(self, path):
@@ -307,7 +308,7 @@ class QM9GapTrainer(StandardOnlineTrainer):
             # better to implement backward via backward_policy
             # but it is for the sake of simplicity implementation
             algo_method.backward_approach = self.backward_approach
-            if self.backward_approach in ["naive", "tlm"]:
+            if self.backward_approach in ["naive", "tlm", "pessimistic"]:
                 algo_method.backward_policy = Backward.Free
                 cfg.log_dir += "-no_sampling_model" if args.no_sampling_model else ""
                 cfg.log_dir += "-one_step" if args.one_forward_step else ""

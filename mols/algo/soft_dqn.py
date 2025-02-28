@@ -466,7 +466,7 @@ class SoftDQN(GFNAlgorithm):
         if self.do_parameterize_p_b:
             transition_losses[final_graph_idx] = 0
         transition_losses[batch.is_sink.to(torch.bool)] *= self.cfg.leaf_coef
-        
+
         traj_losses = scatter(transition_losses, batch_idx, dim=0, dim_size=num_trajs, reduce="sum")
         # This is the log probability of each trajectory
         traj_log_p_F = scatter(log_p_F, batch_idx, dim=0, dim_size=num_trajs, reduce="sum")
@@ -486,7 +486,7 @@ class SoftDQN(GFNAlgorithm):
             "loss": loss.item(),
             "n_loss": n_loss,
             "tb_loss": tb_loss.item(),
-            "tlm": -torch.mean(log_p_B),
+            "minus_meanlogPb": -torch.mean(log_p_B),
             "batch_entropy": -traj_log_p_F.mean(),
             "traj_lens": batch.traj_lens.float().mean(),
         }

@@ -614,7 +614,7 @@ class TrajectoryBalance(GFNAlgorithm):
         tb_loss = traj_losses.mean()
         backward_entropy_loss = 0
         loss = tb_loss + reward_loss + self.cfg.n_loss_multiplier * n_loss
-        tlm = -torch.sum(log_p_B) / torch.count_nonzero(log_p_B) + backward_entropy_loss
+        minus_meanlogPb = -torch.sum(log_p_B) / torch.count_nonzero(log_p_B) + backward_entropy_loss
         info = {
             "offline_loss": traj_losses[: batch.num_offline].mean() if batch.num_offline > 0 else 0,
             "online_loss": traj_losses[batch.num_offline :].mean() if batch.num_online > 0 else 0,
@@ -625,7 +625,7 @@ class TrajectoryBalance(GFNAlgorithm):
             "backward_vs_unif": (traj_unif_log_p_B - traj_log_p_B).pow(2).mean(),
             "logZ": log_Z.mean(),
             "loss": loss.item(),
-            "tlm": tlm,
+            "minus_meanlogPb": minus_meanlogPb,
             "backward_entropy_loss": backward_entropy_loss,
             "n_loss": n_loss,
             "tb_loss": tb_loss.item(),

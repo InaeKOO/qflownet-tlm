@@ -51,7 +51,7 @@ parser.add_argument("--algo", type=str, choices=["tb", "db", "subtb", "dqn"], he
 parser.add_argument(
     "--backward_approach",
     type=str,
-    choices=["uniform", "naive", "tlm", "maxent"],
+    choices=["uniform", "naive", "tlm", "maxent", "pessimistic"],
     default="uniform",
     help="Backward policy approach to use.",
 )
@@ -280,7 +280,7 @@ class SEHFragTrainer(StandardOnlineTrainer):
             # better to implement backward via backward_policy
             # but it is for the sake of simplicity implementation
             algo_method.backward_approach = self.backward_approach
-            if self.backward_approach in ["naive", "tlm"]:
+            if self.backward_approach in ["naive", "tlm", "pessimistic"]:
                 algo_method.backward_policy = Backward.Free
                 cfg.log_dir += "-no_sampling_model" if args.no_sampling_model else ""
                 cfg.log_dir += "-one_step" if args.one_forward_step else ""

@@ -63,15 +63,19 @@ To control hyperparameters, we refer to `bitseq/run.py`.
 Examples of running `DB` from the `bitseq/` directory with learning rate `0.002` and varying backward approaches:
 
 ```
-python bitseq/run.py --objective db --learning_rate 0.002 --backward_approach tlm
+python run.py --objective db --lr 0.002 --backward_approach tlm
 ```
 
 ```
-python bitseq/run.py --objective db --learning_rate 0.002 --backward_approach uniform
+python run.py --objective db --lr 0.002 --backward_approach uniform
 ```
 
 ```
-python bitseq/run.py --objective db --learning_rate 0.002 --backward_approach naive
+python run.py --objective db --lr 0.002 --backward_approach naive
+```
+
+```
+python run.py --objective db --lr 0.002 --backward_approach pessimistic
 ```
 
 ## Molecules

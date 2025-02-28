@@ -75,7 +75,7 @@ class GFNTrainer:
         self.ctx: GraphBuildingEnvContext
         self.task: GFNTask
         self.algo: GFNAlgorithm
-        
+
         self.reverse_updates_order = False
 
         # There are three sources of config values
@@ -102,6 +102,7 @@ class GFNTrainer:
         self._validate_parameters = False
 
         self.inf_loss_cnt = 0
+        self.pessimistic_buffer = []
 
         self.setup()
 

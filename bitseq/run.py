@@ -1,4 +1,5 @@
 import argparse
+import random
 import os
 import time
 import numpy as np
@@ -40,6 +41,7 @@ parser.add_argument("--device", default="cuda", type=str)
 parser.add_argument("--print_every", default=100, type=int)
 parser.add_argument("--validate_every", default=2000, type=int)
 parser.add_argument("--print_modes", default=False, action="store_true")
+parser.add_argument("--log_grad_norm", default=False, action="store_true")
 
 # Base training params
 parser.add_argument("--num_iterations", default=50000, type=int)
@@ -49,7 +51,9 @@ parser.add_argument("--blr", type=float)
 parser.add_argument("--gamma", default=0.9999, type=float)
 parser.add_argument("--dropout", default=0.1, type=float)
 parser.add_argument("--batch_size", default=16, type=int)
-parser.add_argument("--backward_approach", default="uniform", choices=["uniform", "tlm", "naive"], type=str)
+parser.add_argument(
+    "--backward_approach", default="uniform", choices=["uniform", "tlm", "naive", "pessimistic"], type=str
+)
 parser.add_argument("--uniform_init", action="store_false")
 
 parser.add_argument("--objective", choices=["tb", "db", "subtb", "dqn"], type=str)
@@ -76,6 +80,9 @@ parser.add_argument("--m_alpha", default=0.15, type=float)
 parser.add_argument("--entropy_coeff", default=1.0, type=float)
 parser.add_argument("--m_l0", default=-25.0, type=float)
 
+pessimistic_buffer = []
+pessimistic_size = 20
+
 
 def sample_forward(sum_logits, sum_uniform, batch, args):
     # There is a bug in pytorch that allows to sample objects that has 0 probability (happens very rarely but still happens).
@@ -95,6 +102,7 @@ def sample_forward(sum_logits, sum_uniform, batch, args):
 
 
 def TB_train_step(model, target_model, logZ, optimizer, Z_optimizer, pb_optimizer, M, args):
+    global pessimistic_buffer
     # This code is pretty simple because all trajectories in our graph have the same length.
     model.train()
 
@@ -120,19 +128,28 @@ def TB_train_step(model, target_model, logZ, optimizer, Z_optimizer, pb_optimize
             history.append([batch.clone(), batch_cl.clone(), positions.clone(), actions.clone()])
             batch = batch_cl
 
+    pessimistic_buffer.append(history)
+    pessimistic_buffer = pessimistic_buffer[-pessimistic_size:]
+
     if args.backward_approach == "uniform":
         pb_loss, pb_deviation = 0.0, 0.0
     else:
         pb_loss = torch.zeros(args.batch_size).to(args.device)
         pb_deviation = 0.0
-        for i, (_, batch, positions, _) in enumerate(history):
+
+        if args.backward_approach == "pessimistic":
+            history_for_pb_update = history
+        else:
+            history_for_pb_update = random.choice(pessimistic_buffer)
+
+        for i, (_, batch, positions, _) in enumerate(history_for_pb_update):
             _, pb_logits = model(batch.T)
             mask = batch < (2**args.k)
             pb_logits[~mask] = -torch.inf
             logPb = pb_logits - torch.logsumexp(pb_logits, dim=-1).unsqueeze(-1)
             pb_loss += logPb[range(args.batch_size), positions]
             pb_deviation += torch.abs(logPb[mask] - log(1 / (i + 1))).mean().cpu().item()
-        if args.backward_approach == "tlm":
+        if args.backward_approach in ["tlm", "pessimistic"]:
             pb_loss = -torch.mean(pb_loss) / (args.n // args.k)
             pb_loss.backward()
             pb_optimizer.step()
@@ -141,7 +158,7 @@ def TB_train_step(model, target_model, logZ, optimizer, Z_optimizer, pb_optimize
             pb_loss = pb_loss.cpu().item()
         else:
             pb_loss = 0.0
-            
+
     sumlogPf = torch.zeros(args.batch_size).to(args.device)
     sumlogPb = torch.zeros(args.batch_size).to(args.device)
     for i, (prev_batch, batch, positions, actions) in enumerate(history):
@@ -151,7 +168,7 @@ def TB_train_step(model, target_model, logZ, optimizer, Z_optimizer, pb_optimize
             _, pb_logits = target_model(prev_batch.T)
 
         _, _, sum_logits = process_logits(all_logits, pos_mask, args)
-    
+
         sumlogPf += sum_logits[range(args.batch_size), actions] - torch.logsumexp(sum_logits, dim=-1)
 
         if args.backward_approach == "uniform":
@@ -159,7 +176,7 @@ def TB_train_step(model, target_model, logZ, optimizer, Z_optimizer, pb_optimize
         else:
             pb_logits[batch >= (2**args.k)] = -torch.inf
             sumlogPb += pb_logits[range(args.batch_size), positions] - torch.logsumexp(pb_logits, dim=-1)
-            
+
     log_rewards = args.reward_exponent * batch_log_rewards(batch[:, 1:], M, args.k).to(args.device).detach()
     loss = (logZ.sum() + sumlogPf - sumlogPb - log_rewards).pow(2).mean() / (args.n // args.k)
     loss.backward()
@@ -173,6 +190,7 @@ def TB_train_step(model, target_model, logZ, optimizer, Z_optimizer, pb_optimize
 
 
 def DB_train_step(model, target_model, optimizer, pb_optimizer, M, args):
+    global pessimistic_buffer
     # This code is pretty simple because all trajectories in our graph have the same length.
     model.train()
 
@@ -191,35 +209,51 @@ def DB_train_step(model, target_model, optimizer, pb_optimizer, M, args):
         with torch.no_grad():
             _, _, sum_uniform = process_logits(0.0 * all_logits.clone(), pos_mask, args)
 
-            actions, positions, words = sample_forward(sum_logits, sum_uniform, batch, args)
+            try:
+                actions, positions, words = sample_forward(sum_logits, sum_uniform, batch, args)
+            except:
+                print(sum_logits)
+                exit(0)
 
             batch_cl = batch.clone()
             batch_cl[range(args.batch_size), positions] = words
             history.append([batch.clone(), batch_cl.clone(), positions.clone(), actions.clone()])
             batch = batch_cl
-        
+
+    pessimistic_buffer.append(history)
+    pessimistic_buffer = pessimistic_buffer[-pessimistic_size:]
+
+    pb_grad_norm = 0.0
     if args.backward_approach == "uniform":
         pb_loss, pb_deviation = 0.0, 0.0
     else:
         pb_loss = torch.zeros(args.batch_size).to(args.device)
         pb_deviation = 0.0
-        for i, (_, batch, positions, _) in enumerate(history):
+
+        if args.backward_approach == "pessimistic":
+            history_for_pb_update = history
+        else:
+            history_for_pb_update = random.choice(pessimistic_buffer)
+
+        for i, (_, batch, positions, _) in enumerate(history_for_pb_update):
             _, pb_logits = model(batch.T)
             mask = batch < (2**args.k)
             pb_logits[~mask] = -torch.inf
             logPb = pb_logits - torch.logsumexp(pb_logits, dim=-1).unsqueeze(-1)
             pb_loss += logPb[range(args.batch_size), positions]
             pb_deviation += torch.abs(logPb[mask] - log(1 / (i + 1))).mean().cpu().item()
-        if args.backward_approach == "tlm":
+        if args.backward_approach in ["tlm", "pessimistic"]:
             pb_loss = -torch.mean(pb_loss) / (args.n // args.k)
             pb_loss.backward()
+            for p in list(filter(lambda p: p.grad is not None, model.parameters())):
+                pb_grad_norm += p.grad.data.norm(2).item()
             pb_optimizer.step()
             pb_optimizer.zero_grad()
             pb_deviation /= len(history)
             pb_loss = pb_loss.cpu().item()
         else:
             pb_loss = 0.0
-    
+
     loss = torch.tensor(0.0).to(args.device)
     for i, (prev_batch, batch, positions, actions) in enumerate(history):
         pos_mask = prev_batch != 2**args.k
@@ -227,7 +261,7 @@ def DB_train_step(model, target_model, optimizer, pb_optimizer, M, args):
         pos_logits, word_logits, sum_logits = process_logits(all_logits, pos_mask, args)
         prev_logF = all_logits[0, :, 2**args.k]
         prev_logPf = sum_logits[range(args.batch_size), actions] - torch.logsumexp(sum_logits, dim=-1)
-        
+
         all_logits, pb_logits = model(batch.T)
         if args.backward_approach == "tlm":
             _, pb_logits = target_model(batch.T)
@@ -244,14 +278,18 @@ def DB_train_step(model, target_model, optimizer, pb_optimizer, M, args):
 
     loss = loss / (args.n // args.k)
     loss.backward()
+    grad_norm = 0.0
+    for p in list(filter(lambda p: p.grad is not None, model.parameters())):
+        grad_norm += p.grad.data.norm(2).item()
     optimizer.step()
     optimizer.zero_grad()
 
     assert batch[:, 1:].max() < 2**args.k
-    return loss.cpu().item(), batch[:, 1:].cpu(), pb_loss, pb_deviation
+    return loss.cpu().item(), batch[:, 1:].cpu(), pb_loss, pb_deviation, grad_norm, pb_grad_norm
 
 
 def SubTB_train_step(model, target_model, optimizer, pb_optimizer, M, args):
+    global pessimistic_buffer
     # This code is pretty simple because all trajectories in our graph have the same length.
     model.train()
 
@@ -277,19 +315,28 @@ def SubTB_train_step(model, target_model, optimizer, pb_optimizer, M, args):
             history.append([batch.clone(), batch_cl.clone(), positions.clone(), actions.clone()])
             batch = batch_cl
 
+    pessimistic_buffer.append(history)
+    pessimistic_buffer = pessimistic_buffer[-pessimistic_size:]
+
     if args.backward_approach == "uniform":
         pb_loss, pb_deviation = 0.0, 0.0
     else:
         pb_loss = torch.zeros(args.batch_size).to(args.device)
         pb_deviation = 0.0
-        for i, (_, batch, positions, _) in enumerate(history):
+
+        if args.backward_approach == "pessimistic":
+            history_for_pb_update = history
+        else:
+            history_for_pb_update = random.choice(pessimistic_buffer)
+
+        for i, (_, batch, positions, _) in enumerate(history_for_pb_update):
             _, pb_logits = model(batch.T)
             mask = batch < (2**args.k)
             pb_logits[~mask] = -torch.inf
             logPb = pb_logits - torch.logsumexp(pb_logits, dim=-1).unsqueeze(-1)
             pb_loss += logPb[range(args.batch_size), positions]
             pb_deviation += torch.abs(logPb[mask] - log(1 / (i + 1))).mean().cpu().item()
-        if args.backward_approach == "tlm":
+        if args.backward_approach in ["tlm", "pessimistic"]:
             pb_loss = -torch.mean(pb_loss) / (args.n // args.k)
             pb_loss.backward()
             pb_optimizer.step()
@@ -298,17 +345,17 @@ def SubTB_train_step(model, target_model, optimizer, pb_optimizer, M, args):
             pb_loss = pb_loss.cpu().item()
         else:
             pb_loss = 0.0
-    
+
     log_pfs = torch.zeros(args.n // args.k + 1, args.batch_size).to(args.device)
     log_pbs = torch.zeros(args.n // args.k + 1, args.batch_size).to(args.device)
-    log_fs = torch.zeros(args.n // args.k + 1, args.batch_size).to(args.device)  
+    log_fs = torch.zeros(args.n // args.k + 1, args.batch_size).to(args.device)
     for i, (prev_batch, batch, positions, actions) in enumerate(history):
         pos_mask = prev_batch != 2**args.k
         all_logits, _ = model(prev_batch.T)
         pos_logits, word_logits, sum_logits = process_logits(all_logits, pos_mask, args)
         log_fs[i] = all_logits[0, :, 2**args.k]
         log_pfs[i] = sum_logits[range(args.batch_size), actions] - torch.logsumexp(sum_logits, dim=-1)
-        
+
         pos_mask = batch != 2**args.k
         if args.backward_approach == "tlm":
             _, pb_logits = target_model(batch.T)
@@ -322,7 +369,7 @@ def SubTB_train_step(model, target_model, optimizer, pb_optimizer, M, args):
 
         if i + 1 == len(history):
             log_fs[-1] = args.reward_exponent * batch_log_rewards(batch[:, 1:], M, args.k).to(args.device).detach()
-        
+
     loss = torch.tensor(0.0).to(args.device)
     total_lambda = torch.tensor(0.0).to(args.device)
     for i in range(log_fs.shape[0]):
@@ -346,6 +393,7 @@ def SubTB_train_step(model, target_model, optimizer, pb_optimizer, M, args):
 
 
 def SoftDQN_collect_experience(rb, model, target_model, pb_optimizer, M, args, is_learning_started):
+    global pessimistic_buffer
     # This code is pretty simple because all trajectories in our graph have the same length.
 
     # The seqence has length n/k + 1 and at the beginning looks like [2^k + 1, 2^k, 2^k, ..., 2^k].
@@ -399,19 +447,28 @@ def SoftDQN_collect_experience(rb, model, target_model, pb_optimizer, M, args, i
             rb.extend(rb_record)  # add record to replay buffer
             batch = next_batch
 
+    pessimistic_buffer.append(history)
+    pessimistic_buffer = pessimistic_buffer[-pessimistic_size:]
+
     if not is_learning_started or args.backward_approach == "uniform":
         pb_loss, pb_deviation = 0.0, 0.0
     else:
         pb_loss = torch.zeros(args.batch_size).to(args.device)
         pb_deviation = 0.0
-        for i, (observed_batch, positions) in enumerate(history):
+
+        if args.backward_approach == "pessimistic":
+            history_for_pb_update = history
+        else:
+            history_for_pb_update = random.choice(pessimistic_buffer)
+
+        for i, (observed_batch, positions) in enumerate(history_for_pb_update):
             _, pb_logits = model(observed_batch.T)
             mask = observed_batch < (2**args.k)
             pb_logits[~mask] = -torch.inf
             logPb = pb_logits - torch.logsumexp(pb_logits, dim=-1).unsqueeze(-1)
             pb_loss += logPb[range(args.batch_size), positions]
             pb_deviation += torch.abs(logPb[mask] - log(1 / (i + 1))).mean().cpu().item()
-        if args.backward_approach == "tlm":
+        if args.backward_approach in ["tlm", "pessimistic"]:
             pb_loss = -torch.mean(pb_loss) / (args.n // args.k)
             pb_loss.backward()
             pb_optimizer.step()
@@ -499,7 +556,8 @@ def main(args):
     elif args.objective == "subtb":
         experiment_name += f"_lambda={args.subtb_lambda}"
     blr = args.lr if args.blr is None else args.lr
-    experiment_name += f"_lr={args.lr}_blr={blr}_lrg={args.gamma}_pb={args.backward_approach}"
+    gamma = 1 if args.backward_approach == "pessimistic" else args.gamma
+    experiment_name += f"_lr={args.lr}_blr={blr}_lrg={gamma}_pb={args.backward_approach}"
     if args.backward_approach == "tlm":
         experiment_name += f"_tau={args.tau}"
     os.makedirs(experiment_name, exist_ok=True)
@@ -520,18 +578,20 @@ def main(args):
 
     logZ = torch.nn.Parameter(torch.tensor(np.ones(64) * 0.0 / 64, requires_grad=True, device=device))
 
-    if args.backward_approach == "tlm":
+    if args.backward_approach in ["tlm", "pessimistic"]:
         f_params = [v for k, v in dict(model.named_parameters()).items() if not "pb_linear" in k]
         optimizer = torch.optim.Adam(f_params, args.lr, weight_decay=1e-5)
         if args.objective == "tb":
             b_params = [v for k, v in dict(model.named_parameters()).items() if "pb_linear" in k]
         else:
             b_params = [v for k, v in dict(model.named_parameters()).items() if not "pf_linear" in k]
+
         pb_optimizer = torch.optim.Adam(b_params, blr, weight_decay=1e-5)
-        b_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(pb_optimizer, args.gamma)
+        b_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(pb_optimizer, gamma)
     else:
         optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=1e-5)
         pb_optimizer = None
+        b_lr_scheduler = None
     Z_optimizer = torch.optim.Adam([logZ], args.z_lr, weight_decay=1e-5)
 
     rb = TensorDictReplayBuffer(
@@ -562,6 +622,8 @@ def main(args):
         "num_modes": [],
         "corr_w_uniform": [],
         "corr_w_naive": [],
+        "grad_norm": [],
+        "pb_grad_norm": [],
     }
     for it in range(args.num_iterations + 1):
         progress = float(it) / args.num_iterations
@@ -570,7 +632,9 @@ def main(args):
                 model, target_model, logZ, optimizer, Z_optimizer, pb_optimizer, M, args
             )
         elif args.objective == "db":
-            loss, batch, pb_loss, pb_deviation = DB_train_step(model, target_model, optimizer, pb_optimizer, M, args)
+            loss, batch, pb_loss, pb_deviation, grad_norm, pb_grad_norm = DB_train_step(
+                model, target_model, optimizer, pb_optimizer, M, args
+            )
         elif args.objective == "subtb":
             loss, batch, pb_loss, pb_deviation = SubTB_train_step(model, target_model, optimizer, pb_optimizer, M, args)
         elif args.objective == "dqn":
@@ -593,7 +657,7 @@ def main(args):
                     target_param.data.mul_(1 - args.tau)
                     torch.add(target_param.data, param.data, alpha=args.tau, out=target_param.data)
 
-        if args.backward_approach == "tlm":
+        if b_lr_scheduler:
             b_lr_scheduler.step()
 
         sum_rewards += (batch_rewards(batch, M, args.k) ** args.reward_exponent).sum().item() / args.batch_size
@@ -611,6 +675,9 @@ def main(args):
         logs_to_save["pb_loss"].append(pb_loss)
         logs_to_save["pb_deviation"].append(pb_deviation)
         logs_to_save["num_modes"].append(sum(modes))
+        if args.log_grad_norm:
+            logs_to_save["grad_norm"].append(grad_norm)
+            logs_to_save["pb_grad_norm"].append(pb_grad_norm)
 
         if it > 0 and it % args.print_every == 0:
             blr = b_lr_scheduler.get_last_lr()[0] if args.backward_approach == "tlm" else 0
@@ -623,6 +690,8 @@ def main(args):
             np.save(f"{experiment_name}/pb_loss.npy", logs_to_save["pb_loss"])
             np.save(f"{experiment_name}/pb_deviation.npy", logs_to_save["pb_deviation"])
             np.save(f"{experiment_name}/num_modes.npy", logs_to_save["num_modes"])
+            np.save(f"{experiment_name}/grad_norm.npy", logs_to_save["grad_norm"])
+            np.save(f"{experiment_name}/pb_grad_norm.npy", logs_to_save["pb_grad_norm"])
             sum_rewards = 0.0
 
         if it > 0 and it % args.validate_every == 0:
@@ -633,7 +702,7 @@ def main(args):
                         print(M[m])
             mode_nums.append(sum(modes))
 
-            try: 
+            try:
                 corr = compute_correlation(target_model, M, test_set, args, rounds=args.corr_num_rounds)
             except:
                 corr = 0

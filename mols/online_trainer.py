@@ -1,3 +1,4 @@
+import random
 import copy
 import os
 import pathlib
@@ -90,7 +91,7 @@ class StandardOnlineTrainer(GFNTrainer):
         # create optimizers and lr_schedulers
         # Separate Z parameters from non-Z to allow for LR decay on the former
         Z_params = list(self.model._logZ.parameters()) if hasattr(self.model, "_logZ") else []
-        if self.backward_approach == "tlm":
+        if self.backward_approach in ["tlm", "pessimistic"]:
             not_forward_param_names = ["logZ", "remove_node", "remove_edge_attr"]
             params = [
                 p
@@ -114,7 +115,7 @@ class StandardOnlineTrainer(GFNTrainer):
         self.lr_scheduler_Z = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer_Z, lambda step: 2 ** (-step / self.cfg.algo.tb.Z_lr_decay)
         )
-        if self.backward_approach == "tlm":
+        if self.backward_approach in ["tlm", "pessimistic"]:
             self.b_optimizer = self.setup_optimizer(backward_params, self.cfg.opt.backward_learning_rate)
             self.blr_scheduler = torch.optim.lr_scheduler.LambdaLR(
                 self.b_optimizer, lambda step: 2 ** (-step / self.cfg.opt.backward_lr_decay)
@@ -149,14 +150,14 @@ class StandardOnlineTrainer(GFNTrainer):
             f.write(yaml_cfg)
 
     def step(self, batch: gd.Batch, train_it: int):
-        
+
         def update_forward_policy(batch):
             loss, info = self.algo.compute_batch_losses(
                 self.model,
                 batch,
                 self.sampling_model if self.use_sampling_model else None,
             )
-            tlm = info["tlm"]
+            # tlm = info["tlm"]
             if not torch.isfinite(loss):
                 self.inf_loss_cnt += 1
                 if self.inf_loss_cnt > 200:
@@ -177,30 +178,23 @@ class StandardOnlineTrainer(GFNTrainer):
             self.lr_scheduler_Z.step()
             self.optimizer.zero_grad()
             self.optimizer_Z.zero_grad()
-            
+
             return info
-            
+
         def update_backward_policy_if_required(batch):
-            if self.backward_approach == "tlm":
+            if self.backward_approach in ["tlm", "pessimistic"]:
                 # print("2. backward learning")
                 loss, info2 = self.algo.compute_batch_losses(
                     self.model,
                     batch,
                 )
-                tlm = info2["tlm"]
-                if not torch.isfinite(tlm):
+                minus_meanlogPb = info2["minus_meanlogPb"]
+                if not torch.isfinite(minus_meanlogPb):
                     self.inf_loss_cnt += 1
                     if self.inf_loss_cnt > 200:
-                        raise ValueError("tlm is not finite")
+                        raise ValueError("pb_loss is not finite")
                     return {"grad_norm": 0, "grad_norm_clip": 0, "bgrad_norm": 0, "bgrad_norm_clip": 0}
-                if self.backward_approach == "naive":
-                    # print("2.1.a loss.backward()")
-                    loss.backward()
-                elif self.backward_approach == "tlm":
-                    # print("2.1.b tlm.backward()")
-                    tlm.backward()
-                else:
-                    raise KeyError
+                minus_meanlogPb.backward()
                 # with torch.no_grad():
                 #     g0 = model_grad_norm(self.model)
                 #     self.clip_grad_callback(self.model.parameters())
@@ -209,21 +203,25 @@ class StandardOnlineTrainer(GFNTrainer):
                 self.b_optimizer.step()
                 self.blr_scheduler.step()
                 self.b_optimizer.zero_grad()
-                
+
             if self.sampling_tau > 0:
                 for a, b in zip(self.model.parameters(), self.sampling_model.parameters()):
                     b.data.mul_(self.sampling_tau).add_(a.data * (1 - self.sampling_tau))
-                
+
+        self.pessimistic_buffer.append(batch.clone())
+        self.pessimistic_buffer = self.pessimistic_buffer[-20:]
+        batch_for_backward = (
+            random.choice(self.pessimistic_buffer) if self.backward_approach == "pessimistic" else batch
+        )
         if not self.reverse_updates_order:
             info = update_forward_policy(batch)
-            update_backward_policy_if_required(batch)
+            update_backward_policy_if_required(batch_for_backward)
         else:
-            update_backward_policy_if_required(batch)
+            update_backward_policy_if_required(batch_for_backward)
             info = update_forward_policy(batch)
-            
 
         info["lr"] = self.lr_scheduler.get_last_lr()[0]
-        if self.backward_approach == "tlm":
+        if self.backward_approach in ["tlm", "pessimistic"]:
             info["blr"] = self.blr_scheduler.get_last_lr()[0]
 
         return info

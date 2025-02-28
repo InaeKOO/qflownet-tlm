@@ -89,11 +89,15 @@ To control hyperparameters, we refer to `mols/tasks/qm9.py` and `mols/tasks/seh_
 
 Run from the root directory to reproduce the QM9 experiment with `Munchausen DQN`, learning rate `5e-4` and backward approach `tlm`:
 ```bash
-python -m mols.tasks.qm9 --seed 1 --algo dqn --lr 5e-4 --backward_approach tlm
+python mols/tasks/qm9.py --seed 1 --algo dqn --lr 5e-4 --backward_approach tlm
 ```
 To run the sEH experiment with the same hyperparameters:
 ```bash
-python -m mols.tasks.seh_frag --seed 1 --algo dqn --lr 5e-4 --backward_approach tlm
+python mols/tasks/seh_frag.py --seed 1 --algo dqn --lr 5e-4 --backward_approach tlm
+```
+An example of launching `pessimistic` backward approach with the same hyperaparameters:
+```bash
+python mols/tasks/qm9.py --seed 1 --algo dqn --lr 5e-4 --backward_approach pessimistic --no_sampling_model --rand_pb_init
 ```
 
 ## Citation

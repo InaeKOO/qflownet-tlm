@@ -104,10 +104,11 @@ python mols/tasks/qm9.py --seed 1 --algo dqn --lr 5e-4 --backward_approach pessi
 
 Please cite our article if you find it helpful in your work
 ```
-@article{gritsaev2024optimizing,
-  title={Optimizing Backward Policies in GFlowNets via Trajectory Likelihood Maximization},
+@inproceedings{gritsaev2025optimizing,
+  title={Optimizing Backward Policies in {GF}lowNets via Trajectory Likelihood Maximization},
   author={Gritsaev, Timofei and Morozov, Nikita and Samsonov, Sergey and Tiapkin, Daniil},
-  journal={arXiv preprint arXiv:2410.15474},
-  year={2024}
+  booktitle={The Thirteenth International Conference on Learning Representations},
+  year={2025},
+  url={https://openreview.net/forum?id=Xj66fkrlTk}
 }
 ```

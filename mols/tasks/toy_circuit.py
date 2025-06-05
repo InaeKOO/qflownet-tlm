@@ -9,14 +9,14 @@ from datetime import datetime
 
 import numpy as np
 from torch import Tensor
-from gflownet import GFNTask, LogScalar, ObjectProperties
-from gflownet.config import Config, init_empty
-from gflownet.envs.circuit_building_env import AutoregressiveCircuitBuildingContext, CircuitBuildingEnv
-from gflownet.models.circuit_transformer import CircuitTransformerGFN
-from gflownet.online_trainer import StandardOnlineTrainer
-from gflownet.utils.conditioning import TemperatureConditional
-from gflownet.utils.transforms import to_logreward
-from gflownet.utils.circuit import sequence_to_matrices, total_matrix
+from mols import GFNTask, LogScalar, ObjectProperties
+from mols.config import Config, init_empty
+from mols.envs.circuit_building_env import AutoregressiveCircuitBuildingContext, CircuitBuildingEnv
+from mols.models.circuit_transformer import CircuitTransformerGFN
+from mols.online_trainer import StandardOnlineTrainer
+from mols.utils.conditioning import TemperatureConditional
+from mols.utils.transforms import to_logreward
+from mols.utils.circuit import sequence_to_matrices, total_matrix
 
 toffoli = torch.tensor([
     [1,0,0,0,0,0,0,0],
@@ -179,8 +179,9 @@ def main():
     config.cond.temperature.dist_params = [2.0]
     config.cond.temperature.num_thermometer_dim = 1
     config.algo.train_random_action_prob = 0.05
-    
+    print(type(config.task.toy_circuit))
     trial = ToyCircuitTrainer(config)
+    print(trial.__mro__)
     trial.run()
 
 if __name__ == "__main__":

@@ -4,10 +4,10 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from gflownet.config import Config
-from gflownet.envs.graph_building_env import GraphActionCategorical, GraphBuildingEnvContext
-from gflownet.envs.circuit_building_env import CircuitBatch
-from gflownet.models.config import SeqPosEnc
+from mols.config import Config
+from mols.envs.graph_building_env import GraphActionCategorical, GraphBuildingEnvContext
+from mols.envs.circuit_building_env import CircuitBatch
+from mols.models.config import SeqPosEnc
 
 
 class MLPWithDropout(nn.Module):

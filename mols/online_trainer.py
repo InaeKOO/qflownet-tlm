@@ -18,7 +18,7 @@ from mols.data.data_source import DataSource
 from mols.data.replay_buffer import ReplayBuffer
 from mols.models.graph_transformer import GraphTransformerGFN
 
-from .trainer import GFNTrainer
+from mols.trainer import GFNTrainer
 
 
 def model_grad_norm(model):

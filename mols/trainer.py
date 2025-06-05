@@ -29,6 +29,7 @@ from mols.data.data_source import DataSource
 from mols.data.replay_buffer import ReplayBuffer
 from mols.envs.graph_building_env import GraphActionCategorical, GraphBuildingEnv, GraphBuildingEnvContext
 from mols.envs.seq_building_env import SeqBatch
+from mols.envs.circuit_building_env import CircuitBatch
 from mols.utils.metrics import (
     compute_num_modes,
     monte_carlo_compute_correlation_stats,
@@ -206,7 +207,7 @@ class GFNTrainer:
             wrapper = mp_object_wrapper(
                 obj,
                 self.cfg.num_workers,
-                cast_types=(gd.Batch, GraphActionCategorical, SeqBatch),
+                cast_types=(gd.Batch, GraphActionCategorical, SeqBatch, CircuitBatch),
                 pickle_messages=self.cfg.pickle_mp_messages,
             )
             self.to_terminate.append(wrapper.terminate)

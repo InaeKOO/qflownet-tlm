@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 from mols.utils.misc import StrictDataClass
 
@@ -37,6 +37,19 @@ class QM9TaskConfig(StrictDataClass):
     h5_path: str = "./data/qm9/qm9.h5"  # see src/gflownet/data/qm9.py
     model_path: str = "./data/qm9/qm9_model.pt"
 
+@dataclass
+class ToyCircuitTaskConfig(StrictDataClass):
+    """Config for the QuantumCircuitTask
+    
+    Attributes
+    ----------
+    max_qubits : int
+        Maximum number of qubits allowed in the circuit
+    max_gates : int
+        Maximum number of gates allowed in the circuit
+    """
+    num_qubits: int = 0
+    gates: Optional[str] = None
 
 @dataclass
 class QM9MOOTaskConfig(StrictDataClass):
@@ -68,3 +81,4 @@ class TasksConfig(StrictDataClass):
     qm9_moo: QM9MOOTaskConfig = field(default_factory=QM9MOOTaskConfig)
     seh: SEHTaskConfig = field(default_factory=SEHTaskConfig)
     seh_moo: SEHMOOTaskConfig = field(default_factory=SEHMOOTaskConfig)
+    toy_circuit: ToyCircuitTaskConfig = field(default_factory=ToyCircuitTaskConfig)

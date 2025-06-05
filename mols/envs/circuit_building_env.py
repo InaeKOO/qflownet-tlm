@@ -5,7 +5,7 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch_geometric.data import Data
 
-from gflownet.envs.graph_building_env import (
+from mols.envs.graph_building_env import (
     ActionIndex,
     Graph,
     GraphAction,

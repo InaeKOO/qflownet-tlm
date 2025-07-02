@@ -116,7 +116,9 @@ def sequence_to_unitary(seq_indices, action_list, n_qubits: int):
         Unitary matrix U of shape (2**n_qubits, 2**n_qubits) as complex64
     """
     qc = QuantumCircuit(n_qubits)
+    print("seq_indices: ", seq_indices)
     for idx in seq_indices:
+        #print("current idx: ", idx)
         gate = action_list[idx][0]
         q = action_list[idx][1]
         if gate == 'ccx':
@@ -178,17 +180,17 @@ def process_logits(all_logits, pos_mask, args):
     )  # [batch_size, (n/k + 1) * 2^k]
     return pos_logits, word_logits, sum_logits
 
-def batch_log_rewards(batch, U, action_list, n_qubits):
+def batch_log_rewards(batch, unitaries, action_list, n_qubits):
     batch_np = batch.cpu().numpy()
-    log_rewards = [log_reward(batch_np[i], action_list, U, n_qubits) for i in range(batch_np.shape[0])]
+    log_rewards = [log_reward(batch_np[i], action_list, unitaries[i], n_qubits) for i in range(batch_np.shape[0])]
     return torch.tensor(log_rewards)
 
 def reward(s, action_list, U, n_qubits):
     return np.exp(log_reward(s, action_list, U, n_qubits))
 
-def batch_rewards(batch, U, action_list, n_qubits):
+def batch_rewards(batch, unitaries, action_list, n_qubits):
     batch_np = batch.cpu().numpy()
-    rewards = [reward(batch_np[i], action_list, U, n_qubits) for i in range(batch_np.shape[0])]
+    rewards = [reward(batch_np[i], action_list, unitaries[i], n_qubits) for i in range(batch_np.shape[0])]
     return torch.tensor(rewards)
 
 def compute_correlation(model, U, action_list, num_qubits, test_set, args, rounds=10, batch_size=180):

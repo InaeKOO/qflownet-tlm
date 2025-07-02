@@ -8,7 +8,7 @@ from copy import deepcopy
 
 import torch
 from torch.distributions.categorical import Categorical
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage
 from torchrl.data.replay_buffers.samplers import PrioritizedSampler
 from tensordict import TensorDict
@@ -87,138 +87,109 @@ parser.add_argument("--m_l0", default=-25.0, type=float)
 pessimistic_buffer = []
 pessimistic_size = 20
 
+def load_data(path):
+    """
+    Load pre-generated gate sequences and target unitaries from an .npz file.
+    Assumes keys 'sequences' (array of token lists) and 'U' (array of matrices).
+    """
+    npz = np.load(path, allow_pickle=True)
+    return npz['seqs'], npz['unitaries']
+
 class OfflineCircuitDataset(Dataset):
-    def __init__(self, seqs, pad_idx):
-        self.seqs = seqs  # shape [N_samples, seq_len]
-        self.pad = pad_idx
-        self.max_len = seqs.shape[1]
+    def __init__(self, path):
+        self.seqs, self.unitaries = load_data(path)
+        self.pad = args.num_actions
+        self.max_len = self.seqs.shape[1]
 
     def __len__(self):
-        return self.seqs.shape[0] * self.max_len
+        return self.seqs.shape[0]
 
     def __getitem__(self, idx):
-        sample_i = idx // self.max_len
-        step = idx % self.max_len
-        seq = self.seqs[sample_i]
-        inp = [self.pad+1] + list(seq[:step]) + [self.pad] * (self.max_len - step)
-        action = step * (args.num_actions) + int(seq[step])
+        seq = self.seqs[idx]
+        inp = [self.pad+1] + list(seq) + [self.pad] * (self.max_len - len(seq))
+        action = len(seq) * (args.num_actions) + int(seq[len(seq)-1])
         return torch.tensor(inp, dtype=torch.long), torch.tensor(action, dtype=torch.long)
 
-def sample_forward(sum_logits, sum_uniform, batch, args):
-    # There is a bug in pytorch that allows to sample objects that has 0 probability (happens very rarely but still happens).
-    # This loop basically resamples until everything is correct.
-    while True:
-        actions = Categorical(logits=sum_logits.clone()).sample()
-        uniform_actions = Categorical(logits=sum_uniform).sample().to(args.device)
-        uniform_mask = torch.rand(args.batch_size) < args.rand_action_prob
-        actions[uniform_mask] = uniform_actions[uniform_mask]
-        positions = actions // (args.num_actions)
-        if (batch[range(args.batch_size), positions] == args.num_actions).sum() == args.batch_size:
-            break
-    assert positions.min() >= 1
-    assert positions.max() <= args.n // args.num_actions
-    words = actions % (args.num_actions)
-    return actions, positions, words
 
-
-def TB_train_step(model, target_model, logZ, optimizer, Z_optimizer, pb_optimizer, U, action_list, args):
+def TB_train_step(model, target_model, logZ, optimizer, Z_optimizer, pb_optimizer, batch_seqs, unitaries, action_list, args):
     global pessimistic_buffer
     # This code is pretty simple because all trajectories in our graph have the same length.
     model.train()
-
+    B,L = batch_seqs.shape
     # The seqence has length n/k + 1 and at the beginning looks like [2^k + 1, 2^k, 2^k, ..., 2^k].
     # 2^k + 1: [BOS] token, 2^k: token for "empty" word.
-    batch = torch.tensor([[args.num_actions + 1] + ([args.num_actions] * (args.max_length)) for i in range(args.batch_size)]).to(
-        args.device
-    )
-    history = []
+    sos_idx = args.num_actions + 1
+    pad_idx = args.num_actions
+    inp = torch.full((B, L+1), pad_idx, dtype=torch.long, device=args.device)
+    inp[:, 0] = sos_idx
+    inp[:, 1:1+L] = batch_seqs
 
-    for i in range(args.max_length):
-        pos_mask = batch != args.num_actions
-        all_logits, _ = model(batch.T)
+    all_logits, _ = model(inp.T)
 
-        pos_logits, word_logits, sum_logits = process_logits(all_logits, pos_mask, args)
-        with torch.no_grad():
-            _, _, sum_uniform = process_logits(0.0 * all_logits.clone(), pos_mask, args)
+    sumlogPf = 0.0
+    for t in range(1, L+1):
+        logits_t = all_logits[t].T            # [B, V]
+        a_t      = batch_seqs[:, t-1]         # [B]
+        logp     = logits_t[range(B), a_t] \
+                 - torch.logsumexp(logits_t, dim=-1)
+        sumlogPf += logp
 
-            actions, positions, words = sample_forward(sum_logits, sum_uniform, batch, args)
+    log_rewards = args.reward_exponent * \
+        batch_log_rewards(batch_seqs, unitaries, action_list, args.n_qubits) \
+        .to(args.device).detach()         # [B]
 
-            batch_cl = batch.clone()
-            batch_cl[range(args.batch_size), positions] = words
-            history.append([batch.clone(), batch_cl.clone(), positions.clone(), actions.clone()])
-            batch = batch_cl
-
-    pessimistic_buffer.append(history)
-    pessimistic_buffer = pessimistic_buffer[-pessimistic_size:]
-
+    sumlogPb = 0.0
     if args.backward_approach == "uniform":
-        pb_loss, pb_deviation = 0.0, 0.0
+        # uniform backward: each step에 1/(t+1)
+        for t in range(L):
+            sumlogPb += torch.log(1.0/(t+1))
     else:
-        pb_loss = torch.zeros(args.batch_size).to(args.device)
-        pb_deviation = 0.0
+        for t in range(1, L+1):
+            # prefix including the chosen token at t
+            prefix = inp[:, :t+1]            # [B, t+1]
+            # if tlm, use target_model, otherwise use model
+            net = target_model if args.backward_approach=="tlm" else model
+            _, pb_all_logits = net(prefix.T)  # [t+1, B, V] but we only need pos t
+            logits_t = pb_all_logits[t].T     # [B, V]
 
-        if args.backward_approach == "pessimistic":
-            history_for_pb_update = history
-        else:
-            history_for_pb_update = random.choice(pessimistic_buffer)
+            # mask out invalid tokens (PAD/SOS) if needed
+            mask = torch.ones_like(logits_t, dtype=torch.bool)
+            mask[:, pad_idx] = False
+            mask[:, sos_idx] = False
+            logits_t[~mask] = -float('inf')
 
-        for i, (_, batch, positions, _) in enumerate(history_for_pb_update):
-            _, pb_logits = model(batch.T)
-            mask = batch < (args.num_actions)
-            pb_logits[~mask] = -torch.inf
-            logPb = pb_logits - torch.logsumexp(pb_logits, dim=-1).unsqueeze(-1)
-            pb_loss += logPb[range(args.batch_size), positions]
-            pb_deviation += torch.abs(logPb[mask] - log(1 / (i + 1))).mean().cpu().item()
-        if args.backward_approach in ["tlm", "pessimistic"]:
-            pb_loss = -torch.mean(pb_loss) / (args.max_length)
-            pb_loss.backward()
-            pb_optimizer.step()
-            pb_optimizer.zero_grad()
-            pb_deviation /= len(history)
-            pb_loss = pb_loss.cpu().item()
-        else:
-            pb_loss = 0.0
+            a_t  = batch_seqs[:, t-1]         # [B]
+            logpb = logits_t[range(B), a_t] \
+                  - torch.logsumexp(logits_t, dim=-1)
+            sumlogPb += logpb
 
-    sumlogPf = torch.zeros(args.batch_size).to(args.device)
-    sumlogPb = torch.zeros(args.batch_size).to(args.device)
-    for i, (prev_batch, batch, positions, actions) in enumerate(history):
-        pos_mask = prev_batch != args.num_actions
-        all_logits, pb_logits = model(prev_batch.T)
-        if args.backward_approach == "tlm":
-            _, pb_logits = target_model(prev_batch.T)
+    target = log_rewards - logZ.sum()    # [B]
+    loss = ((sumlogPf - sumlogPb - target)**2).mean() / L
 
-        _, _, sum_logits = process_logits(all_logits, pos_mask, args)
-
-        sumlogPf += sum_logits[range(args.batch_size), actions] - torch.logsumexp(sum_logits, dim=-1)
-
-        if args.backward_approach == "uniform":
-            sumlogPb += torch.log(torch.tensor(1 / (i + 1))).to(args.device)
-        else:
-            pb_logits[batch >= (args.num_actions)] = -torch.inf
-            sumlogPb += pb_logits[range(args.batch_size), positions] - torch.logsumexp(pb_logits, dim=-1)
-
-    log_rewards = args.reward_exponent * batch_log_rewards(batch[:, 1:], U, action_list, args.n_qubits).to(args.device).detach()
-    loss = (logZ.sum() + sumlogPf - sumlogPb - log_rewards).pow(2).mean() / (args.max_length)
+    optimizer.zero_grad()
+    Z_optimizer.zero_grad()
     loss.backward()
     optimizer.step()
     Z_optimizer.step()
-    optimizer.zero_grad()
-    Z_optimizer.zero_grad()
 
-    assert batch[:, 1:].max() < args.num_actions
-    return loss.cpu().item(), batch[:, 1:].cpu(), pb_loss, pb_deviation
+    return loss.item()
 
 
 def main(args):
     device = args.device
     assert args.validate_every % args.print_every == 0
     action_list = construct_action_list(args.n_qubits)
+    print(action_list)
     args.num_actions = len(action_list)
-    U = sequence_to_unitary([12,13,4,7,6,5,0,4,3,2,1,0],action_list, args.n_qubits)
-    test_set = OfflineCircuitDataset(args.data_path, args.num_actions).seqs
-    print(f"test set size: {test_set.__len__()}")
-
-    experiment_name = f"results/{args.seed}_n={args.n_qubits}_rexp={args.reward_exponent}_{args.objective}"
+    #U = sequence_to_unitary([12,13,4,7,6,5,0,4,3,2,1,0],action_list, args.n_qubits)
+    test_set = OfflineCircuitDataset(args.data_path)
+    loader = DataLoader(
+        test_set,
+        batch_size=16,
+        shuffle=True,             # 매 epoch마다 섞어 주면 좋습니다
+        drop_last=True,           # 마지막 미니배치가 작으면 버릴 수도 있고
+    )
+    experiment_name = f"results/{args.seed}_n={args.n_qubits}"
     blr = args.lr if args.blr is None else args.lr
     gamma = args.gamma
     experiment_name += f"_lr={args.lr}_blr={blr}_lrg={gamma}_pb={args.backward_approach}"
@@ -280,79 +251,80 @@ def main(args):
     }
     for it in range(args.num_iterations + 1):
         progress = float(it) / args.num_iterations
-        if args.objective == "tb":
-            loss, batch, pb_loss, pb_deviation = TB_train_step(
-                model, target_model, logZ, optimizer, Z_optimizer, pb_optimizer, U, action_list, args
-            )
-        else:
-            with torch.no_grad():
-                for param, target_param in zip(model.parameters(), target_model.parameters()):
-                    target_param.data.mul_(1 - args.tau)
-                    torch.add(target_param.data, param.data, alpha=args.tau, out=target_param.data)
+        for seqs, unitaries in loader:
+            if args.objective == "tb":
+                loss, batch, pb_loss, pb_deviation = TB_train_step(
+                    model, target_model, logZ, optimizer, Z_optimizer, pb_optimizer, seqs, unitaries, action_list, args
+                )
+            else:
+                with torch.no_grad():
+                    for param, target_param in zip(model.parameters(), target_model.parameters()):
+                        target_param.data.mul_(1 - args.tau)
+                        torch.add(target_param.data, param.data, alpha=args.tau, out=target_param.data)
 
-        if b_lr_scheduler:
-            b_lr_scheduler.step()
+            if b_lr_scheduler:
+                b_lr_scheduler.step()
 
-        sum_rewards += (batch_rewards(batch, U, action_list, args.n_qubits) ** args.reward_exponent).sum().item() / args.batch_size
+            sum_rewards += (batch_rewards(seqs, unitaries, action_list, args.n_qubits) ** args.reward_exponent).sum().item() / args.batch_size
 
-        batch_strings = [seq for seq in batch]
-        if modes:
-            continue
-        for i in range(args.batch_size):
-            if unitary_distance(U, sequence_to_unitary(batch_strings[i], action_list, args.n_qubits)) <= 1e-6:
-                modes = True
-                break
+            batch_strings = [seq for seq in seqs]
+            if modes:
+                continue
+            for i in range(args.batch_size):
+                if unitary_distance(test_set.unitaries[i], sequence_to_unitary(batch_strings[i], action_list, args.n_qubits)) <= 1e-6:
+                    modes = True
+                    break
 
-        logs_to_save["loss"].append(loss)
-        logs_to_save["pb_loss"].append(pb_loss)
-        logs_to_save["pb_deviation"].append(pb_deviation)
-        logs_to_save["num_modes"].append(sum(modes))
+            logs_to_save["loss"].append(loss)
+            logs_to_save["pb_loss"].append(pb_loss)
+            logs_to_save["pb_deviation"].append(pb_deviation)
+            logs_to_save["num_modes"].append(sum(modes))
 
-        if it > 0 and it % args.print_every == 0:
-            blr = b_lr_scheduler.get_last_lr()[0] if args.backward_approach == "tlm" else 0
-            print(
-                f"{it=}\tloss: {loss:.4f}\tpb_loss: {pb_loss:.4f}\tpb_deviation: {pb_deviation:.6f}\t"
-                f"num_modes: {sum(modes)}\tavg_reward: {sum_rewards / args.print_every}\t"
-                f"logZ: {logZ.sum().cpu().item():.6f}\tblr: {blr:.6f}"
-            )
-            np.save(f"{experiment_name}/loss.npy", logs_to_save["loss"])
-            np.save(f"{experiment_name}/pb_loss.npy", logs_to_save["pb_loss"])
-            np.save(f"{experiment_name}/pb_deviation.npy", logs_to_save["pb_deviation"])
-            np.save(f"{experiment_name}/num_modes.npy", logs_to_save["num_modes"])
-            np.save(f"{experiment_name}/grad_norm.npy", logs_to_save["grad_norm"])
-            np.save(f"{experiment_name}/pb_grad_norm.npy", logs_to_save["pb_grad_norm"])
-            sum_rewards = 0.0
+            if it > 0 and it % args.print_every == 0:
+                blr = b_lr_scheduler.get_last_lr()[0] if args.backward_approach == "tlm" else 0
+                print(
+                    f"{it=}\tloss: {loss:.4f}\tpb_loss: {pb_loss:.4f}\tpb_deviation: {pb_deviation:.6f}\t"
+                    f"num_modes: {sum(modes)}\tavg_reward: {sum_rewards / args.print_every}\t"
+                    f"logZ: {logZ.sum().cpu().item():.6f}\tblr: {blr:.6f}"
+                )
+                np.save(f"{experiment_name}/loss.npy", logs_to_save["loss"])
+                np.save(f"{experiment_name}/pb_loss.npy", logs_to_save["pb_loss"])
+                np.save(f"{experiment_name}/pb_deviation.npy", logs_to_save["pb_deviation"])
+                np.save(f"{experiment_name}/num_modes.npy", logs_to_save["num_modes"])
+                np.save(f"{experiment_name}/grad_norm.npy", logs_to_save["grad_norm"])
+                np.save(f"{experiment_name}/pb_grad_norm.npy", logs_to_save["pb_grad_norm"])
+                sum_rewards = 0.0
 
-        if it > 0 and it % args.validate_every == 0:
-            if args.print_modes:
-                print("found modes:")
-                if modes:
-                    print(U)
-            mode_nums.append(sum(modes))
+            if it > 0 and it % args.validate_every == 0:
+                if args.print_modes:
+                    print("found modes:")
+                    if modes:
+                        print("found modes")
+                mode_nums.append(sum(modes))
 
-            try:
-                corr = compute_correlation(target_model, U, action_list, args.n_qubits, test_set, args, rounds=args.corr_num_rounds)
-            except:
-                corr = 0
-            print(f"reward correlation with uniform backward:\t{corr:.3f}")
-            corr_nums.append(corr)
-            logs_to_save["corr_w_uniform"].append(corr)
-            np.save(f"{experiment_name}/corr_w_uniform.npy", logs_to_save["corr_w_uniform"])
-            if args.backward_approach != "uniform":
                 try:
-                    corr = compute_correlation_wpb(target_model, U, action_list, args.n_qubits, test_set, args, rounds=args.corr_num_rounds)
+                    corr = compute_correlation(target_model, U, action_list, args.n_qubits, test_set, args, rounds=args.corr_num_rounds)
                 except:
                     corr = 0
-                print(f"reward correlation with naive backward:\t{corr:.3f}")
-                logs_to_save["corr_w_naive"].append(corr)
-                np.save(f"{experiment_name}/corr_w_naive.npy", logs_to_save["corr_w_naive"])
-            else:
-                np.save(f"{experiment_name}/corr_w_naive.npy", logs_to_save["corr_w_uniform"])
+                print(f"reward correlation with uniform backward:\t{corr:.3f}")
+                corr_nums.append(corr)
+                logs_to_save["corr_w_uniform"].append(corr)
+                np.save(f"{experiment_name}/corr_w_uniform.npy", logs_to_save["corr_w_uniform"])
+                if args.backward_approach != "uniform":
+                    try:
+                        corr = compute_correlation_wpb(target_model, U, action_list, args.n_qubits, test_set, args, rounds=args.corr_num_rounds)
+                    except:
+                        corr = 0
+                    print(f"reward correlation with naive backward:\t{corr:.3f}")
+                    logs_to_save["corr_w_naive"].append(corr)
+                    np.save(f"{experiment_name}/corr_w_naive.npy", logs_to_save["corr_w_naive"])
+                else:
+                    np.save(f"{experiment_name}/corr_w_naive.npy", logs_to_save["corr_w_uniform"])
 
-            print(f"spent minutes:\t{(time.time() - previous_time) / 60:.2f}")
-            previous_time = time.time()
+                print(f"spent minutes:\t{(time.time() - previous_time) / 60:.2f}")
+                previous_time = time.time()
 
-            np.save(f"{experiment_name}/num_modes.npy", logs_to_save["num_modes"])
+                np.save(f"{experiment_name}/num_modes.npy", logs_to_save["num_modes"])
 
 
 if __name__ == "__main__":

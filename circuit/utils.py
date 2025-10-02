@@ -7,6 +7,15 @@ from torch.distributions.categorical import Categorical
 
 from scipy.stats import spearmanr
 
+def set_random_seeds(seed, deterministic=False):
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = deterministic
+
 basis_gates = ['h', 'x', 'z', 'cx', 'ccx']
 # Mapping from gate labels to functions that apply them on a QuantumCircuit
 ALPHABET = {
@@ -116,8 +125,9 @@ def sequence_to_unitary(seq_indices, action_list, n_qubits: int):
         Unitary matrix U of shape (2**n_qubits, 2**n_qubits) as complex64
     """
     qc = QuantumCircuit(n_qubits)
-    print("seq_indices: ", seq_indices)
     for idx in seq_indices:
+        if idx == len(action_list):
+            break
         #print("current idx: ", idx)
         gate = action_list[idx][0]
         q = action_list[idx][1]
@@ -152,7 +162,6 @@ def log_reward(seq_indices, action_list, target_U: np.ndarray, n_qubits: int = 3
     Compute the log-fidelity reward for a given action sequence relative to a target unitary.
 
     Fidelity = |Tr(U_seq^dagger @ target_U)| / 2**n_qubits
-    Log-reward = log(fidelity + eps)
 
     Args:
         seq_indices: iterable of integer indices into action_list
@@ -162,11 +171,17 @@ def log_reward(seq_indices, action_list, target_U: np.ndarray, n_qubits: int = 3
         eps: small constant to avoid log(0)
 
     Returns:
-        Log-fidelity reward as a float
+        Fidelity reward as a float
     """
     U_seq = sequence_to_unitary(seq_indices, action_list, n_qubits)
     fid = abs(np.trace(U_seq.conj().T @ target_U)) / (2**n_qubits)
-    return np.log(fid + eps)
+    return fid
+
+def log_length_reward(seq_indices, action_list, n_qubits: int = 3, eps: float = 1e-9) -> float:
+    """
+    Compute the log-length reward for a given action sequence.
+    """
+    return -np.log(len(seq_indices) + eps)
 
 def process_logits(all_logits, pos_mask, args):
     # Model predicts positional logits p_i and word logits for each position w_ij.
@@ -185,12 +200,22 @@ def batch_log_rewards(batch, unitaries, action_list, n_qubits):
     log_rewards = [log_reward(batch_np[i], action_list, unitaries[i], n_qubits) for i in range(batch_np.shape[0])]
     return torch.tensor(log_rewards)
 
+def batch_log_length_rewards(batch, action_list, n_qubits):
+    batch_np = batch.cpu().numpy()
+    log_rewards = [log_length_reward(batch_np[i], action_list, n_qubits) for i in range(batch_np.shape[0])]
+    return torch.tensor(log_rewards)
+
 def reward(s, action_list, U, n_qubits):
     return np.exp(log_reward(s, action_list, U, n_qubits))
 
 def batch_rewards(batch, unitaries, action_list, n_qubits):
     batch_np = batch.cpu().numpy()
     rewards = [reward(batch_np[i], action_list, unitaries[i], n_qubits) for i in range(batch_np.shape[0])]
+    return torch.tensor(rewards)
+
+def batch_length_rewards(batch, action_list, n_qubits):
+    batch_np = batch.cpu().numpy()
+    rewards = [log_length_reward(batch_np[i], action_list, n_qubits) for i in range(batch_np.shape[0])]
     return torch.tensor(rewards)
 
 def compute_correlation(model, U, action_list, num_qubits, test_set, args, rounds=10, batch_size=180):

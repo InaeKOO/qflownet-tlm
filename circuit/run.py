@@ -22,7 +22,8 @@ from utils import (
     log_reward,
     process_logits,
     batch_log_rewards,
-    batch_rewards,
+    batch_log_length_rewards,
+    batch_length_rewards,
     compute_correlation,
     compute_correlation_wpb
 )
@@ -34,6 +35,7 @@ parser.add_argument("--seed", default=1, type=int)
 parser.add_argument("--n_qubits", type=int, default=3)
 parser.add_argument("--num_actions", type=int, default=18)
 parser.add_argument("--max_length", type=int, default=12)
+parser.add_argument("--reward_exponent", default=2.0, type=float)
 parser.add_argument("--data_path", type=str, default=None,
                     help="Path to .npz dataset for offline quantum-circuit training")
 parser.add_argument("--offline_epochs", type=int, default=10,
@@ -93,11 +95,11 @@ def load_data(path):
     Assumes keys 'sequences' (array of token lists) and 'U' (array of matrices).
     """
     npz = np.load(path, allow_pickle=True)
-    return npz['seqs'], npz['unitaries']
+    return npz['seqs'], npz['unitaries'], npz['lengths']
 
 class OfflineCircuitDataset(Dataset):
     def __init__(self, path):
-        self.seqs, self.unitaries = load_data(path)
+        self.seqs, self.unitaries, self.lengths = load_data(path)
         self.pad = args.num_actions
         self.max_len = self.seqs.shape[1]
 
@@ -106,17 +108,16 @@ class OfflineCircuitDataset(Dataset):
 
     def __getitem__(self, idx):
         seq = self.seqs[idx]
-        inp = [self.pad+1] + list(seq) + [self.pad] * (self.max_len - len(seq))
-        action = len(seq) * (args.num_actions) + int(seq[len(seq)-1])
-        return torch.tensor(inp, dtype=torch.long), torch.tensor(action, dtype=torch.long)
+        return seq, self.unitaries[idx], self.lengths[idx]
 
 
-def TB_train_step(model, target_model, logZ, optimizer, Z_optimizer, pb_optimizer, batch_seqs, unitaries, action_list, args):
+def TB_train_step(model, target_model, logZ, optimizer, Z_optimizer, pb_optimizer, batch_seqs, unitaries, lengths, action_list, args):
     global pessimistic_buffer
     # This code is pretty simple because all trajectories in our graph have the same length.
     model.train()
     B,L = batch_seqs.shape
     # The seqence has length n/k + 1 and at the beginning looks like [2^k + 1, 2^k, 2^k, ..., 2^k].
+    lengths = lengths.to(args.device)
     # 2^k + 1: [BOS] token, 2^k: token for "empty" word.
     sos_idx = args.num_actions + 1
     pad_idx = args.num_actions
@@ -125,17 +126,21 @@ def TB_train_step(model, target_model, logZ, optimizer, Z_optimizer, pb_optimize
     inp[:, 1:1+L] = batch_seqs
 
     all_logits, _ = model(inp.T)
+    print(args.num_actions)
 
     sumlogPf = 0.0
     for t in range(1, L+1):
-        logits_t = all_logits[t].T            # [B, V]
+        print(all_logits.shape)
+        logits_t = all_logits[t]            # [B, V]
         a_t      = batch_seqs[:, t-1]         # [B]
         logp     = logits_t[range(B), a_t] \
                  - torch.logsumexp(logits_t, dim=-1)
-        sumlogPf += logp
+        # Only add logp for sequences that are long enough
+        mask = (lengths >= t)
+        sumlogPf += (logp * mask).sum()
 
     log_rewards = args.reward_exponent * \
-        batch_log_rewards(batch_seqs, unitaries, action_list, args.n_qubits) \
+        batch_log_length_rewards(batch_seqs, action_list, args.n_qubits) \
         .to(args.device).detach()         # [B]
 
     sumlogPb = 0.0
@@ -146,22 +151,26 @@ def TB_train_step(model, target_model, logZ, optimizer, Z_optimizer, pb_optimize
     else:
         for t in range(1, L+1):
             # prefix including the chosen token at t
-            prefix = inp[:, :t+1]            # [B, t+1]
-            # if tlm, use target_model, otherwise use model
-            net = target_model if args.backward_approach=="tlm" else model
-            _, pb_all_logits = net(prefix.T)  # [t+1, B, V] but we only need pos t
-            logits_t = pb_all_logits[t].T     # [B, V]
+            prefix = inp[:, : t + 1]
+            net    = target_model if args.backward_approach == "tlm" else model
+            _, raw_back = net(prefix.T)
+
+            # ── shape normalisation ──
+            if raw_back.dim() == 3:          # [t+1, B, V]
+                logits_t = raw_back[-1]     # [B, V]
+            else:                            # [B, V]
+                logits_t = raw_back         # [B, V]
 
             # mask out invalid tokens (PAD/SOS) if needed
-            mask = torch.ones_like(logits_t, dtype=torch.bool)
-            mask[:, pad_idx] = False
-            mask[:, sos_idx] = False
-            logits_t[~mask] = -float('inf')
+            logits_t[:, pad_idx] = -float('inf')
+            logits_t[:, sos_idx] = -float('inf')
 
             a_t  = batch_seqs[:, t-1]         # [B]
             logpb = logits_t[range(B), a_t] \
                   - torch.logsumexp(logits_t, dim=-1)
-            sumlogPb += logpb
+            # Only add logpb for sequences that are long enough
+            seq_mask = (lengths >= t)
+            sumlogPb += (logpb * seq_mask).sum()
 
     target = log_rewards - logZ.sum()    # [B]
     loss = ((sumlogPf - sumlogPb - target)**2).mean() / L
@@ -172,7 +181,7 @@ def TB_train_step(model, target_model, logZ, optimizer, Z_optimizer, pb_optimize
     optimizer.step()
     Z_optimizer.step()
 
-    return loss.item()
+    return loss.item(), batch_seqs
 
 
 def main(args):
@@ -185,7 +194,7 @@ def main(args):
     test_set = OfflineCircuitDataset(args.data_path)
     loader = DataLoader(
         test_set,
-        batch_size=16,
+        batch_size=args.batch_size,
         shuffle=True,             # 매 epoch마다 섞어 주면 좋습니다
         drop_last=True,           # 마지막 미니배치가 작으면 버릴 수도 있고
     )
@@ -199,7 +208,7 @@ def main(args):
     print(experiment_name)
 
     model = TransformerModel(
-        ntoken=args.num_actions + 2,
+        ntoken=20,
         d_model=64,
         d_hid=64,
         nhead=8,
@@ -232,7 +241,7 @@ def main(args):
         priority_key="td_error",
     )
 
-    modes = [False]
+    modes = False
     sum_rewards = 0.0
 
     corr_nums = []
@@ -251,45 +260,45 @@ def main(args):
     }
     for it in range(args.num_iterations + 1):
         progress = float(it) / args.num_iterations
-        for seqs, unitaries in loader:
-            if args.objective == "tb":
-                loss, batch, pb_loss, pb_deviation = TB_train_step(
-                    model, target_model, logZ, optimizer, Z_optimizer, pb_optimizer, seqs, unitaries, action_list, args
-                )
-            else:
-                with torch.no_grad():
-                    for param, target_param in zip(model.parameters(), target_model.parameters()):
-                        target_param.data.mul_(1 - args.tau)
-                        torch.add(target_param.data, param.data, alpha=args.tau, out=target_param.data)
+        for seqs, unitaries, lengths in loader:
+            print(seqs[0], unitaries[0], lengths[0])
+            loss, batch_seqs = TB_train_step(
+                model, target_model, logZ, optimizer, Z_optimizer, pb_optimizer, seqs, unitaries, lengths, action_list, args
+            )
 
-            if b_lr_scheduler:
+            # Move scheduler step after optimizer step to avoid warning
+            if b_lr_scheduler and it > 0:
                 b_lr_scheduler.step()
 
-            sum_rewards += (batch_rewards(seqs, unitaries, action_list, args.n_qubits) ** args.reward_exponent).sum().item() / args.batch_size
+            sum_rewards += (batch_length_rewards(seqs, action_list, args.n_qubits)).sum().item() / seqs.shape[0]
 
-            batch_strings = [seq for seq in seqs]
+            batch_strings = [seq for seq in batch_seqs]
             if modes:
                 continue
-            for i in range(args.batch_size):
-                if unitary_distance(test_set.unitaries[i], sequence_to_unitary(batch_strings[i], action_list, args.n_qubits)) <= 1e-6:
-                    modes = True
-                    break
+            for i in range(seqs.shape[0]):
+                # Convert sequence to list and remove padding tokens
+                seq_list = batch_strings[i].cpu().numpy().tolist()
+                # Remove padding tokens (args.num_actions)
+                seq_list = [x for x in seq_list if x != args.num_actions]
+                if len(seq_list) > 0:
+                    try:
+                        if unitary_distance(unitaries[i].cpu().numpy(), sequence_to_unitary(seq_list, action_list, args.n_qubits)) <= 1e-6:
+                            modes = True
+                            break
+                    except:
+                        continue
 
             logs_to_save["loss"].append(loss)
-            logs_to_save["pb_loss"].append(pb_loss)
-            logs_to_save["pb_deviation"].append(pb_deviation)
-            logs_to_save["num_modes"].append(sum(modes))
+            logs_to_save["num_modes"].append(1 if modes else 0)
 
             if it > 0 and it % args.print_every == 0:
                 blr = b_lr_scheduler.get_last_lr()[0] if args.backward_approach == "tlm" else 0
                 print(
-                    f"{it=}\tloss: {loss:.4f}\tpb_loss: {pb_loss:.4f}\tpb_deviation: {pb_deviation:.6f}\t"
-                    f"num_modes: {sum(modes)}\tavg_reward: {sum_rewards / args.print_every}\t"
+                    f"{it=}\tloss: {loss:.4f}\t"
+                    f"num_modes: {1 if modes else 0}\tavg_reward: {sum_rewards / args.print_every}\t"
                     f"logZ: {logZ.sum().cpu().item():.6f}\tblr: {blr:.6f}"
                 )
                 np.save(f"{experiment_name}/loss.npy", logs_to_save["loss"])
-                np.save(f"{experiment_name}/pb_loss.npy", logs_to_save["pb_loss"])
-                np.save(f"{experiment_name}/pb_deviation.npy", logs_to_save["pb_deviation"])
                 np.save(f"{experiment_name}/num_modes.npy", logs_to_save["num_modes"])
                 np.save(f"{experiment_name}/grad_norm.npy", logs_to_save["grad_norm"])
                 np.save(f"{experiment_name}/pb_grad_norm.npy", logs_to_save["pb_grad_norm"])
@@ -300,10 +309,12 @@ def main(args):
                     print("found modes:")
                     if modes:
                         print("found modes")
-                mode_nums.append(sum(modes))
+                mode_nums.append(1 if modes else 0)
 
+                # Create a test set from the dataset for correlation computation
+                test_sequences = test_set.seqs[:100]  # Use first 100 sequences as test set
                 try:
-                    corr = compute_correlation(target_model, U, action_list, args.n_qubits, test_set, args, rounds=args.corr_num_rounds)
+                    corr = compute_correlation(target_model, unitaries[0], action_list, args.n_qubits, test_sequences, args, rounds=args.corr_num_rounds)
                 except:
                     corr = 0
                 print(f"reward correlation with uniform backward:\t{corr:.3f}")
@@ -312,7 +323,7 @@ def main(args):
                 np.save(f"{experiment_name}/corr_w_uniform.npy", logs_to_save["corr_w_uniform"])
                 if args.backward_approach != "uniform":
                     try:
-                        corr = compute_correlation_wpb(target_model, U, action_list, args.n_qubits, test_set, args, rounds=args.corr_num_rounds)
+                        corr = compute_correlation_wpb(target_model, unitaries[0], action_list, args.n_qubits, test_sequences, args, rounds=args.corr_num_rounds)
                     except:
                         corr = 0
                     print(f"reward correlation with naive backward:\t{corr:.3f}")
